@@ -1766,11 +1766,139 @@ document.addEventListener('input',e=>{const k=e.target.dataset&&e.target.dataset
   if(k==='cname')d.c.name=v;
   if(k==='cja')d.c.ja=v;});
 document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.dataset&&e.target.dataset.in&&e.target.tagName!=='TEXTAREA')e.target.blur();});
+/* Read a MyLiftLog export locally. Plans and completed sets are separate in that format. */
+function importMyLiftLog(source){
+  const {logs,settings,currentState,daySessions}=source;
+  if(!Array.isArray(logs)||!settings||!currentState||!daySessions)throw Error('Unsupported backup');
+  const result=seed();
+  const keyMap=new Map(Object.entries({
+    bench:'bench',squat:'squat',halfDead:'rack-pull',floorDead:'deadlift',shoulderPress:'ohp',
+    legpress:'leg-press',calf:'calf',chinning:'chinup',machine_row:'machine-row',preacher:'db-preacher-1',
+    lying_ext:'skull',shoulder:'machine-shoulder',hack_squat:'hack-squat',dips:'dips',pec_fly:'pec-fly',
+    cable_pressdown:'pushdown',rear_delt_fly:'rear-fly',bulgarian_split_squat:'bulgarian',incline_db:'incline-db',
+    seated_row:'seated-row',latpulldown:'lat-pull',side_raise:'side-raise',leg_curl:'leg-curl',
+    leg_extension:'leg-ext',machine_shoulder_press:'machine-shoulder',cable_side_raise:'cable-side',
+    incline_db_curl:'incline-curl',cable_curl:'cable-curl'
+  }));
+  const extras=[
+    ['db-preacher-1','One-Arm Dumbbell Preacher Curl','ワンハンドDBプリーチャーカール','ARMS','DUMBBELL'],
+    ['rotary-pull','Rotary Pulldown','ロータリープルダウンマシン','BACK','MACHINE'],
+    ['dy-row','D.Y. Row','DYロウ','BACK','MACHINE'],
+    ['machine-pulldown','Machine Pulldown','マシンプルダウン','BACK','MACHINE'],
+    ['assisted-dip','Assisted Dip','アシストディップス','CHEST','MACHINE']
+  ];
+  const nameMap=new Map(Object.entries({
+    'インクラインDBプレス':'incline-db','インクラインダンベルカール':'incline-curl',
+    'デクラインマシンプレス':'decline-machine','デクラインプレスマシン':'decline-machine',
+    'インクラインマシンプレス':'incline-machine','インクラインプレスマシン':'incline-machine',
+    'ハーフデッド':'rack-pull','ワンハンドロウ':'db-row','ベントオーバーロー':'bent-row'
+  }));
+  const exercises=new Map(LIB.map(e=>[e.id,e]));
+  for(const [id,name,ja,part,eq] of extras){
+    const ex={id,name,ja,part,eq};
+    exercises.set(id,ex);result.custom.push(ex);nameMap.set(ja,id);
+  }
+  function exercise(key,name){
+    const id=nameMap.get(name)||keyMap.get(key);
+    if(id)return exercises.get(id);
+    const match=LIB.find(e=>e.ja===name||e.name===name);
+    if(match)return match;
+    if(typeof name!=='string'||!name.trim())throw Error('Missing exercise');
+    const custom={id:'import-ex-'+result.custom.length,name,ja:name,part:'OTHER',eq:'OTHER'};
+    result.custom.push(custom);exercises.set(custom.id,custom);nameMap.set(name,custom.id);
+    return custom;
+  }
+  const count=value=>parseInt(value,10);
+  const weightedPlan=(ex,values,reps)=>{
+    const plan={ex,sets:count(values.plannedSets),reps:count(reps)};
+    if(!(plan.sets>0&&plan.sets<=200&&plan.reps>0))throw Error('Invalid exercise plan');
+    if(values.plannedWeight!=null&&values.plannedWeight!==''&&Number.isFinite(+values.plannedWeight))plan.initialWeight=+values.plannedWeight;
+    return plan;
+  };
+  const backLift=currentState.lastCompletedBackLiftKey==='halfDead'?'floorDead':
+    currentState.lastCompletedBackLiftKey==='floorDead'?'halfDead':(currentState.backCompletedCount%2?'floorDead':'halfDead');
+  const menus=[['chest','bench'],['back',backLift],['shoulder_arm','shoulderPress'],['legs','squat']];
+  const templates=TEMPLATES[0].routines;
+  const menuById=new Map();
+  menus.forEach(([id,lift],index)=>{
+    const template=templates[index];
+    function mainPlan(key){
+      const override=settings.mainSetOverrides?.['Four-'+id+'-'+key+'-four-main-'+key];
+      const last=logs.slice().reverse().find(l=>l.exerciseKey===key&&l.doneSets>0&&count(l.plannedSets)>0&&count(l.plannedReps)>0);
+      const values=override||last;
+      return values?weightedPlan(keyMap.get(key),values,values.plannedReps):{ex:keyMap.get(key),sets:3,reps:5};
+    }
+    const routine={id,name:template.name,ja:template.ja,color:template.color,items:[]};
+    const slots=settings.fourMenuAccessorySlots?.[id];
+    if(Array.isArray(slots)){
+      const main=mainPlan(lift);
+      if(id==='back')main.alternate=mainPlan(lift==='halfDead'?'floorDead':'halfDead');
+      routine.items=[main,...slots.map(slot=>weightedPlan(exercise(slot.key,slot.name).id,slot,slot.reps))];
+    }else routine.items=clone(template.items);
+    menuById.set(id,routine);
+  });
+  result.routines=[...menuById.values()];
+  result.nextId=menuById.has(currentState.nextMenuKey)?currentState.nextMenuKey:result.routines[0].id;
+  if(+settings.increment>0)result.settings.step=+settings.increment;
+  result.liftLogReferenceMax={};
+  for(const [key,w] of Object.entries(settings.maxes||{}))if(keyMap.has(key))result.liftLogReferenceMax[keyMap.get(key)]=w;
+  const groups=new Map(),trained=new Set();
+  for(const log of logs){
+    const done=log.sets.filter(s=>s.done&&!s.skipped);
+    if(!done.length)continue;
+    const date=log.date;
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(date))throw Error('Invalid log date');
+    const split=menuById.get(log.menuKey);
+    const program=split?split.id:'b'+count(log.block)+'-r'+count(log.rotation)+'-d'+count(log.day);
+    const id='liftlog-'+date+'-'+program;
+    if(!groups.has(id))groups.set(id,{id,date,program,split,entries:[]});
+    groups.get(id).entries.push({log,done});
+    trained.add(date);
+  }
+  for(const {id,date,program,split,entries} of groups.values()){
+    entries.sort((a,b)=>a.log.ts-b.log.ts);
+    let day=daySessions[date+'-'+(split?'four-menu':program)]||{};
+    if(split&&day.performedSplitKey!==program)day={};
+    const times=entries.map(e=>e.log.ts);
+    const onDate=t=>Number.isFinite(t)&&dk(t)===date;
+    const start=[day.createdAt,day.ts,...times].find(onDate)??new Date(date+'T12:00:00').getTime();
+    const end=Math.max(start,...[day.completedAt,...times].filter(onDate));
+    const pains=new Set(),items=entries.map(({log,done})=>{
+      const ex=exercise(log.exerciseKey,log.exerciseName);
+      const sets=done.map(s=>{
+        const set={w:Number(s.weight),r:count(s.reps)};
+        if(!Number.isFinite(set.w)||!Number.isFinite(set.r)||set.r<0)throw Error('Invalid set');
+        if(s.rpe!=null&&s.rpe!==''&&Number.isFinite(+s.rpe))set.rpe=+s.rpe;
+        return set;
+      });
+      const notes=log.note?[log.note]:[];
+      if(log.rpe&&log.rpe!=='未入力')notes.push('RPE '+log.rpe+'（種目全体）');
+      const reported=(log.pains||[]).filter(p=>p!=='なし');
+      if(reported.length)notes.push('体調：'+reported.join('・'));
+      if(reported.includes('肩'))pains.add('SHOULDER');
+      if(reported.includes('膝'))pains.add('KNEE');
+      const item={ex:ex.id,name:ex.name,reps:count(log.plannedReps)||sets[0].r,sets};
+      if(notes.length)item.note=notes.join('\n');
+      return item;
+    });
+    const s={id,rid:program,name:split?.name||'LIFTLOG DAY '+count(entries[0].log.day),ja:split?.ja||day.dayName||'旧メニュー',
+      color:split?.color||'silver',start,end,at:Math.max(...times),items};
+    if(pains.size)s.cond={pain:[...pains].sort()};
+    result.sessions.push(s);
+  }
+  result.rests=[...new Set(Object.values(daySessions).filter(s=>s.completed&&s.isRest&&!trained.has(s.date)).map(s=>s.date))].sort();
+  for(const test of source.maxTestResults||[]){
+    const id=keyMap.get(test.liftKey);
+    if(id&&+test.reps===1)(result.maxes[id]||=[]).push({t:test.ts,w:test.weight});
+  }
+  return result;
+}
+
 document.addEventListener('change',e=>{if(e.target.id!=='imp')return;const f=e.target.files&&e.target.files[0];if(!f)return;const rd=new FileReader();
-  rd.onload=()=>{try{const s=JSON.parse(rd.result);if(!valid(s))throw 0;const old=new Set(S.sessions.map(x=>x.id));S=norm(Object.assign(seed(),{lang:undefined},s,{active:null,cloudSeen:S.cloudSeen}));S.sessions.sort((a,b)=>a.start-b.start);migrate();
+  rd.onload=()=>{try{const payload=JSON.parse(String(rd.result).replace(/^\uFEFF/,''));const legacy=!valid(payload);const s=legacy?importMyLiftLog(payload):payload;const old=new Set(S.sessions.map(x=>x.id));S=norm(Object.assign(seed(),{lang:undefined},s,{active:null,cloudSeen:S.cloudSeen}));S.sessions.sort((a,b)=>a.start-b.start);migrate();
     const ids=new Set(S.sessions.map(x=>x.id));S.deleted=(S.deleted||[]).filter(x=>!ids.has(x));old.forEach(id=>{if(!ids.has(id)){S.deleted.push(id);cloudQueue('s_'+id);}});
-    S.sessions.forEach(x=>{x.at=Date.now();cloudQueue('s_'+x.id);});U.pick=null;U.workoutOpen=false;while(sheets.length)closeSheet();applyFx();refresh();say('Restored');}catch(err){say('This file cannot be read');}};
-  rd.readAsText(f);});
+    S.sessions.forEach(x=>{x.at=Date.now();cloudQueue('s_'+x.id);});if(legacy)recalcPR();U.pick=null;U.rot=null;U.summary=null;U.tab='home';U.workoutOpen=false;while(sheets.length)closeSheet();applyFx();refresh();say('Restored · '+S.sessions.length+' sessions');}catch(err){say('This file cannot be read');}};
+  rd.onerror=()=>say('This file cannot be read');e.target.value='';rd.readAsText(f);});
 
 /* swipe: between exercises in a workout, between routines on the plate; a finger on the plate also leans the lamp */
 let sw=null;
